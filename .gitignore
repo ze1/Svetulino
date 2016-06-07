@@ -243,3 +243,6 @@ ModelManifest.xml
 
 # FAKE - F# Make
 .fake/
+/__vm/.Svetulino.vsarduino.h
+/__vm/Compile.vmps.xml
+/__vm/Configuration.Debug.vmps.xml
