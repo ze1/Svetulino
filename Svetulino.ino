@@ -13,13 +13,17 @@
 
 #define PROGRAM_SIGN	0xA02E1080
 
-#define INPUT_PIN		2
-#define RELAY_PIN		4
-#define SWITCH_PIN      7
+#define LED_PIN			LED_BUILTIN
 
-#define INPUT_PIN_2		3
-#define RELAY_PIN_2		5
-#define SWITCH_PIN_2    8
+#define IR_PIN			2
+#define PIR_PIN			3
+#define RELAY_PIN		4
+#define PIR_OFF_DELAY	60000
+
+#define IR_PIN_2		5
+#define PIR_PIN_2		6
+#define RELAY_PIN_2		7
+#define PIR_OFF_DELAY_2	30000
 
 HardwareSerial &s = Serial;
 bool N() { s.println(""); return true; }
@@ -34,7 +38,7 @@ struct CFG {
 	uint32_t data_item[128];
 
 	CFG(uint32_t prog_sign)
-		: prog_sign(prog_sign), data_addr(), data_size(), data_item({}) {
+		: prog_sign(prog_sign), data_addr(), data_size(), data_item() {
 
 	}
 
@@ -152,11 +156,13 @@ struct IR {
 	uint8_t ir_pin;
 	IRrecv ir_recv;
 
-	uint8_t sw_pin;
-	bool sw_state;
-
 	uint8_t relay_pin;
 	bool relay_state;
+
+	uint8_t pir_pin;
+	uint32_t pir_delay;
+	uint32_t pir_timer;
+	bool pir_state;
 
 	struct Input {
 		IR &ir;
@@ -167,7 +173,7 @@ struct IR {
 		uint8_t count;
 
 		Input(IR &ir)
-			: ir(ir), code(), check(), result(), count() {
+			: ir(ir), code(), allow(), check(), result(), count() {
 
 		}
 
@@ -179,14 +185,20 @@ struct IR {
 
 				value = input.value;
 				ir.ir_recv.resume();
-				S(" >>> IR("); S(ir.ir_pin); S("): "); SH(value); S(" >>> ");;
+				N(); S(" >>> IR("); S(ir.ir_pin); S("): "); SH(value); S(" ");
 			}
 
 			unsigned char t = !code ? 0 : (now < check ? 1 : (now < result ? 2 : 3));
 			S(!t ? "." : (t == 1 ? "-" : (t == 2 ? "+" : "=")));
 
-			if (value == 0xffffffff)
+			if (t == 2 && count != 5)
+				digitalWrite(LED_PIN, HIGH);
+
+			if (value == 0xffffffff) {
+
+				if (t == 2) return 0;
 				value = code;
+			}
 
 			if (!value) {
 
@@ -208,17 +220,17 @@ struct IR {
 				return value;
 			}
 
-			if (value == code && t == 2 && S(" +++ COUNT(") && S(++count) && S(") +++ "))
+			if (value == code && t == 2 && S(" +++ COUNT(") && S(++count) && S(")")) 
 				return 0;
 
-			if (t && S(" ::: RESET(T") && S(t) && S(") ::: "))
+			if (t && S(" ::: RESET(T") && S(t) && S(")"))
 				N();
 
 			code = value;
 			count = 0xff;
 			check = now + 5000;
 			result = now + 10000;
-			S(" *** CODE("); SH(code); S(") *** ");
+			S(" *** CODE("); SH(code); S(")");
 
 			if (now < allow) return 0;
 			allow = now + 1000;
@@ -227,58 +239,125 @@ struct IR {
 	}
 	input;
 
-	IR(uint8_t ir_pin, uint8_t sw_pin, uint8_t relay_pin)
-		: ir_pin(ir_pin), ir_recv(ir_pin), sw_pin(sw_pin), sw_state(), relay_pin(relay_pin), relay_state(), input(*this) {
+	IR(uint8_t ir_pin, uint8_t relay_pin, uint8_t pir_pin, uint32_t pir_delay)
+		: ir_pin(ir_pin), ir_recv(ir_pin), relay_pin(relay_pin), relay_state(), pir_pin(pir_pin), pir_delay(pir_delay), pir_timer(), pir_state(), input(*this) {
 
 	}
 
 	void Setup() {
 
-		N(); S("SETUP IR("); S(ir_pin); S("), RELAY("); S(relay_pin); S(")");
+		N(); S("SETUP IR("); S(ir_pin); S("), PIR("); S(pir_pin); S("), RELAY("); S(relay_pin); S(")");
 
-		pinMode(ir_pin, INPUT);
-		ir_recv.enableIRIn();
+		if (ir_pin) {
 
-		pinMode(sw_pin, INPUT);
-		sw_state = digitalRead(sw_pin) == HIGH;
+			pinMode(ir_pin, INPUT);
+			ir_recv.enableIRIn();
+		}
 
-		relay_state = sw_state;
+		if (pir_pin) {
 
+			pinMode(pir_pin, INPUT);
+			pir_state = digitalRead(pir_pin) == HIGH;
+			pir_timer = pir_delay;
+		}
+
+		relay_state = true;
 		pinMode(relay_pin, OUTPUT);
-		digitalWrite(relay_pin, relay_state ? HIGH : LOW);
+		digitalWrite(relay_pin, relay_state ? LOW : HIGH);
 
 		N();
 	}
 
 	void Loop() {
 
-		bool sw = digitalRead(sw_pin) == HIGH;
-		if (sw != sw_state) {
+		uint32_t now = millis();
+		bool relay = relay_state;
 
-			sw_state = sw;
-			relay_state = sw_state;
-			digitalWrite(relay_pin, sw || relay_state ? HIGH : LOW);
-			N(); S(" /// RELAY("); S(relay_pin); S(relay_state ? "): [HIGH] /// " : "): [LOW] /// "); N();
-		}
+		if (ir_pin) {
 
-		uint32_t input_value = input.Loop();
-		if (input_value) {
+			uint32_t ir_code = input.Loop();
+			if (ir_code &&
+				cfg_.Exists(ir_code)) {
 
-			if (cfg_.Exists(input_value)) {
-
-				relay_state = !relay_state;
-				digitalWrite(relay_pin, sw || relay_state ? HIGH : LOW);
-				N(); S(" >>> RELAY("); S(relay_pin); S(relay_state ? "): [HIGH] >>> " : "): [LOW] >>> "); N();
+				relay = !relay;
+				N(); S(" >>> IR("); S(ir_pin); S("): "); SH(ir_code); S(" [PWRBTN] ");
 			}
 		}
+
+		if (pir_pin) {
+
+			bool pir = digitalRead(pir_pin) == HIGH;
+			if (pir != pir_state) {
+
+				pir_state = pir;
+				N(); S(" >>> PIR("); S(pir_pin); S("): "); S(pir_state ? "ON" : "OFF");
+
+				if (pir_state) {
+					
+					if (!relay) {
+
+						relay = true;
+						S(" EXECUTE"); 
+					}
+				}
+				else {
+
+					if (!relay) {
+
+						pir_timer = 0;
+					}
+					else {
+
+						if (!pir_delay) {
+
+							pir_timer = 0;
+							relay = false;
+							S(" EXECUTE"); 
+						}
+						else {
+
+							pir_timer = now + pir_delay;
+							S(" DELAY "); S(pir_delay); S(" MSEC");
+						}
+					}
+				}
+			}
+			if (!pir_state && pir_timer) {
+
+				if (pir_timer < now) {
+
+					pir_timer = 0;
+					relay = false;
+					S(" === PIR("); S(pir_pin); S("): OFF EXECUTE === "); 
+				}
+				else {
+
+					if (!relay) {
+						
+						pir_timer = 0;
+						S(" === PIR("); S(pir_pin); S("): OFF RESET === "); 
+					}
+				}
+			}
+		}
+
+		if (relay != relay_state) {
+
+			relay_state = relay;
+			digitalWrite(relay_pin, relay_state ? LOW : HIGH);
+			N(); S(" >>> RELAY("); S(relay_pin); S(relay_state ? "): ON" : "): OFF"); S(" >>> "); N();
+		}
+
 	}
 }
 ir_[1] = {
-	IR(INPUT_PIN, SWITCH_PIN, RELAY_PIN)
+	IR(IR_PIN, RELAY_PIN, PIR_PIN, PIR_OFF_DELAY)
 	//,IR(INPUT_PIN_2, RELAY_PIN_2)
 };
 
 void setup() {
+
+	pinMode(LED_PIN, OUTPUT);
 
 	s.begin(9600);
 
@@ -293,11 +372,15 @@ void setup() {
 
 void loop() {
 
+	uint32_t t = millis();
+
+	digitalWrite(LED_PIN, LOW);
+
 	for (IR *ir = &ir_[0], *end = ir + sizeof(ir_) / sizeof(IR);
 		ir < end;
 		++ir
 		)
 		ir->Loop();
 
-	delay(100);
+	delay(200 - (millis() - t));
 }
